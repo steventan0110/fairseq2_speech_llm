@@ -99,7 +99,7 @@ class NllbTokenizer(SentencePieceTokenizer):
             # Target sequences are expected to start with an EOS, followed by
             # the language token.
             prefix_tokens = ["</s>", f"__{lang}__"]
-            suffix_tokens = ["</s>"]
+            suffix_tokens = []
         else:
             raise ValueError(
                 f"`mode` must be 'source' or 'target', but is '{mode}' instead."

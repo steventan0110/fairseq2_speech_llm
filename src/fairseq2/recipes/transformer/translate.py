@@ -50,7 +50,7 @@ class TextTranslateConfig:
 
     # Data
     dataset: Union[str, Path] = "foo"  # TODO: change!
-    """The name, path, or path to the asset card of the text dataset."""
+    """The name or path to the asset card of the text dataset."""
 
     source_lang: str = "eng_Latn"
     """The code of the language to translate from."""
@@ -78,7 +78,7 @@ class TextTranslateConfig:
     """The data type of the model."""
 
     # Generation
-    generator_mode: Literal["beam_search", "sampling"] = "beam_search"
+    mode: Literal["beam_search", "sampling"] = "beam_search"
     """The mode of sequence generation."""
 
     beam_search: BeamSearchConfig = field(default_factory=lambda: BeamSearchConfig())
@@ -203,8 +203,6 @@ def load_text_translator(
 
     gang = setup_root_gang(log)
 
-    seed = config.seed
-
     # Load the tokenizer.
     model_card = retrieve_asset_card(config.model)
 
@@ -258,41 +256,30 @@ def load_text_translator(
 
     # Initialize the sequence generator.
     generator = _create_sequence_generator(
-        model, config.generator_mode, config.beam_search, config.sampling
+        model, config.mode, config.beam_search, config.sampling
     )
 
     # Initialize the generator unit.
-    src_output_file = output_dir.joinpath(
-        f"translations/{config.source_lang}-{config.target_lang}/rank_{gang.rank}.src.txt"
-    )
-
-    hyp_output_file = output_dir.joinpath(
-        f"translations/{config.source_lang}-{config.target_lang}/rank_{gang.rank}.hyp.txt"
+    output_file = output_dir.joinpath(
+        f"translations/{config.source_lang}-{config.target_lang}/rank_{gang.rank}.txt"
     )
 
     try:
-        src_output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
     except OSError as ex:
         raise RuntimeError(
-            f"The output directory '{src_output_file.parent}' cannot be created. See nested exception for details."
+            f"The output directory ({output_file.parent}) cannot be created. See nested exception for details."
         ) from ex
 
     try:
-        src_output_fp = src_output_file.open("w")
+        output_fp = output_file.open("w")
     except OSError as ex:
         raise RuntimeError(
-            f"The output file '{src_output_file}' cannot be created. See nested exception for details."
-        ) from ex
-
-    try:
-        hyp_output_fp = hyp_output_file.open("w")
-    except OSError as ex:
-        raise RuntimeError(
-            f"The output file '{hyp_output_file}' cannot be created. See nested exception for details."
+            f"The output file ({output_file}) cannot be created. See nested exception for details."
         ) from ex
 
     unit = TextTranslationUnit(
-        generator, tokenizer, config.target_lang, gang, src_output_fp, hyp_output_fp
+        generator, tokenizer, config.target_lang, gang, output_fp
     )
 
     text_encoder = tokenizer.create_encoder(
@@ -306,10 +293,8 @@ def load_text_translator(
         config.max_seq_len,
         batching=StaticBatching(config.batch_size),
         num_prefetch=config.num_prefetch,
-        seed=seed,
+        seed=config.seed,
     )
-
-    seed += 1
 
     # Initialize the generator.
     return Generator[SequenceBatch](
@@ -317,7 +302,7 @@ def load_text_translator(
         data_reader=data_reader,
         root_gang=gang,
         metrics_dir=output_dir.joinpath("metrics"),
-        seed=seed,
+        seed=config.seed,
         wall_watch=wall_watch,
     )
 
@@ -327,8 +312,7 @@ class TextTranslationUnit(AbstractGeneratorUnit[SequenceBatch]):
     """Represents a text translation unit."""
 
     _converter: SequenceToTextConverter
-    _src_output_stream: TextIO
-    _hyp_output_stream: TextIO
+    _output_stream: TextIO
     _metric_bag: Seq2SeqGenerationMetricBag
 
     def __init__(
@@ -337,31 +321,15 @@ class TextTranslationUnit(AbstractGeneratorUnit[SequenceBatch]):
         tokenizer: TextTokenizer,
         target_lang: str,
         gang: Gang,
-        src_output_stream: TextIO,
-        hyp_output_stream: TextIO,
+        output_stream: TextIO,
     ) -> None:
-        """
-        :param generator:
-            The sequence generator.
-        :param tokenizer:
-            The tokenizer to encode target text.
-        :param target_lang:
-            The code of the language to translate to.
-        :param gang:
-            The gang for distributed translation.
-        :param src_output_stream:
-            The output stream to dump sentences in the source language.
-        :param hyp_output_stream:
-            The output stream to dump hypotheses.
-        """
         super().__init__(generator.model)
 
         self._converter = SequenceToTextConverter(
             generator, tokenizer, task="translation", target_lang=target_lang
         )
 
-        self._src_output_stream = src_output_stream
-        self._hyp_output_stream = hyp_output_stream
+        self._output_stream = output_stream
 
         self._metric_bag = Seq2SeqGenerationMetricBag(gang)
 
@@ -371,7 +339,7 @@ class TextTranslationUnit(AbstractGeneratorUnit[SequenceBatch]):
             raise ValueError("`batch.example` must not be `None`.")
 
         try:
-            srcs = batch.example["text"]
+            refs = batch.example["text"]
         except KeyError:
             raise ValueError("`batch.example` must contain a 'text' item.")
 
@@ -379,23 +347,17 @@ class TextTranslationUnit(AbstractGeneratorUnit[SequenceBatch]):
 
         self._metric_bag.update_batch_metrics(output, batch.num_elements())
 
-        # Dump source sentences.
-        stream = self._src_output_stream
+        stream = self._output_stream
 
-        for src in srcs:
-            stream.write(src)
+        for ref, hyp in zip(refs, hyps):
+            stream.write("REF: ")
+            stream.write(ref)
             stream.write("\n")
-
-        stream.flush()
-
-        # Dump hypotheses.
-        stream = self._hyp_output_stream
-
-        for hyp in hyps:
+            stream.write("HYP: ")
             stream.write(hyp)
-            stream.write("\n")
+            stream.write("\n\n")
 
-        stream.flush()
+            stream.flush()
 
     @property
     @override
@@ -416,7 +378,7 @@ def _create_sequence_generator(
         return _create_sampling_generator(model, sampling_config)
 
     raise ValueError(
-        f"`config.generator_mode` must be 'sampling' or 'beam_search', but is '{mode}' instead."
+        f"`config.mode` must be 'sampling' or 'beam_search', but is '{mode}' instead."
     )
 
 

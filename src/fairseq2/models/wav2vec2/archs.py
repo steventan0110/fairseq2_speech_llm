@@ -48,6 +48,11 @@ def _large_lv60k() -> Wav2Vec2Config:
     return config
 
 
+# @wav2vec2_arch("pseudo_dinosr_base")
+# def _pseudo_dinosr_base() -> Wav2Vec2Config:
+#     return Wav2Vec2Config()
+
+
 @wav2vec2_arch("pseudo_dinosr_base")
 def _pseudo_dinosr_base() -> Wav2Vec2Config:
     layer_descs = [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] * 3

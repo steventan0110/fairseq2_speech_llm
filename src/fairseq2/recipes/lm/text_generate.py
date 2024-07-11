@@ -6,23 +6,19 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional, TextIO, Union, final
 
 import torch
 
-from fairseq2.assets import AssetNotFoundError, default_asset_store
+from fairseq2.assets import default_asset_store
 from fairseq2.assets.utils import retrieve_asset_card
 from fairseq2.checkpoint import CheckpointModelMetadataProvider
 from fairseq2.config_registry import ConfigRegistry
 from fairseq2.data.text import TextTokenDecoder, TextTokenizer, load_text_tokenizer
 from fairseq2.datasets import StaticBatching
-from fairseq2.datasets.instruction import (
-    GenericInstructionDataset,
-    load_instruction_dataset,
-)
+from fairseq2.datasets.instruction import load_instruction_dataset
 from fairseq2.gang import Gang
 from fairseq2.generation import (
     BeamSearchSequenceGenerator,
@@ -53,7 +49,7 @@ class TextGenerateConfig:
 
     # Data
     dataset: Union[str, Path] = "oa2_gsm8k_safety"  # TODO: change!
-    """The name, path, or path to the asset card of the instruction dataset."""
+    """The name or path to the asset card of the instruction dataset."""
 
     max_seq_len: int = 8192
     """The maximum sequence length."""
@@ -102,16 +98,16 @@ class SamplingConfig:
     sampler: Literal["top-p", "top-k"] = "top-p"
     """The sampling algorithm."""
 
-    top_p: float = 1.0
+    top_p: float = 0.9
     """The cumulative probability threshold for top-p sampling."""
 
-    top_k = 1
+    top_k = 10
     """The number of top candidates to select from for top-k sampling."""
 
     min_gen_len: int = 1
     """The minimum generation length."""
 
-    max_gen_len: int = 2048
+    max_gen_len: int = 512
     """The maximum generation length."""
 
     max_seq_len: Optional[int] = None
@@ -126,7 +122,7 @@ class SamplingConfig:
     normalize_scores: bool = True
     """If ``True``, normalizes scores by lengths of generated sequences."""
 
-    temperature: float = 1.0
+    temperature: float = 0.6
     """The logit temperature."""
 
     unk_penalty: float = 0.0
@@ -241,8 +237,6 @@ def load_text_generator(
     dp_gang = gangs["dp"]  # data
     tp_gang = gangs["tp"]  # tensor
 
-    seed = config.seed
-
     # Load the tokenizer.
     model_card = retrieve_asset_card(config.model)
 
@@ -253,26 +247,13 @@ def load_text_generator(
     log.info("Tokenizer loaded.")
 
     # Load the dataset.
-    try:
-        dataset_card = retrieve_asset_card(config.dataset)
-    except AssetNotFoundError:
-        dataset_card = None
+    dataset_card = retrieve_asset_card(config.dataset)
 
-    if dataset_card is not None:
-        log.info("Loading {} instruction dataset.", dataset_card.name)
+    log.info("Loading {} instruction dataset.", dataset_card.name)
 
-        dataset = load_instruction_dataset(dataset_card)
+    dataset = load_instruction_dataset(dataset_card)
 
-        log.info("Dataset loaded.")
-    else:
-        try:
-            path = Path(config.dataset)
-        except ValueError:
-            raise AssetNotFoundError(
-                config.dataset, f"An asset with the name '{config.dataset}' cannot be found."  # type: ignore[arg-type]
-            )
-
-        dataset = GenericInstructionDataset.from_path(path)
+    log.info("Dataset loaded.")
 
     # Load the model.
     log.info("Loading {} model on data parallel rank 0 (per shard).", model_card.name)
@@ -304,41 +285,25 @@ def load_text_generator(
 
     # Initialize the generator unit.
     if tp_gang.rank == 0:
-        text_output_file = output_dir.joinpath(f"output/rank_{dp_gang.rank}.txt")
-        json_output_file = output_dir.joinpath(f"output/rank_{dp_gang.rank}.jsonl")
+        output_file = output_dir.joinpath(f"output/rank_{dp_gang.rank}.txt")
 
         try:
-            text_output_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.parent.mkdir(parents=True, exist_ok=True)
         except OSError as ex:
             raise RuntimeError(
-                f"The output directory '{text_output_file.parent}' cannot be created. See nested exception for details."
+                f"The output directory ({output_file.parent}) cannot be created. See nested exception for details."
             ) from ex
 
         try:
-            text_output_fp = text_output_file.open("w")
+            output_fp = output_file.open("w")
         except OSError as ex:
             raise RuntimeError(
-                f"The output file '{text_output_file}' cannot be created. See nested exception for details."
+                f"The output file ({output_file}) cannot be created. See nested exception for details."
             ) from ex
-
-        try:
-            json_output_fp = json_output_file.open("w")
-        except OSError as ex:
-            raise RuntimeError(
-                f"The output file '{json_output_file}' cannot be created. See nested exception for details."
-            ) from ex
-
     else:
-        text_output_fp = None
-        json_output_fp = None
+        output_fp = None
 
-    unit = TextGenerateUnit(
-        generator,
-        tokenizer,
-        dp_gang,
-        text_output_stream=text_output_fp,
-        json_output_stream=json_output_fp,
-    )
+    unit = TextGenerateUnit(generator, tokenizer, dp_gang, output_stream=output_fp)
 
     data_reader = dataset.create_prompt_reader(
         tokenizer,
@@ -346,10 +311,8 @@ def load_text_generator(
         config.max_seq_len,
         batching=StaticBatching(config.batch_size),
         num_prefetch=config.num_prefetch,
-        seed=seed,
+        seed=config.seed,
     )
-
-    seed += 1
 
     # Initialize the generator.
     return Generator[SequenceBatch](
@@ -359,7 +322,7 @@ def load_text_generator(
         dp_gang=dp_gang,
         tp_gang=tp_gang,
         metrics_dir=output_dir.joinpath("metrics"),
-        seed=seed,
+        seed=config.seed,
         wall_watch=wall_watch,
     )
 
@@ -370,8 +333,7 @@ class TextGenerateUnit(AbstractGeneratorUnit[SequenceBatch]):
 
     _generator: SequenceGenerator
     _text_decoder: TextTokenDecoder
-    _text_output_stream: Optional[TextIO]
-    _json_output_stream: Optional[TextIO]
+    _output_stream: Optional[TextIO]
     _metric_bag: SequenceGenerationMetricBag
 
     def __init__(
@@ -379,8 +341,7 @@ class TextGenerateUnit(AbstractGeneratorUnit[SequenceBatch]):
         generator: SequenceGenerator,
         tokenizer: TextTokenizer,
         gang: Gang,
-        text_output_stream: Optional[TextIO],
-        json_output_stream: Optional[TextIO],
+        output_stream: Optional[TextIO],
     ) -> None:
         super().__init__(generator.model)
 
@@ -388,8 +349,7 @@ class TextGenerateUnit(AbstractGeneratorUnit[SequenceBatch]):
 
         self._text_decoder = tokenizer.create_decoder()
 
-        self._text_output_stream = text_output_stream
-        self._json_output_stream = json_output_stream
+        self._output_stream = output_stream
 
         self._metric_bag = SequenceGenerationMetricBag(gang)
 
@@ -403,19 +363,16 @@ class TextGenerateUnit(AbstractGeneratorUnit[SequenceBatch]):
         except KeyError:
             raise ValueError("`batch.example` must contain a 'prompt' item.")
 
-        sample_ids = batch.example["id"]
-
         output = self._generator(batch.seqs, batch.padding_mask)
 
         self._metric_bag.update_batch_metrics(output)
 
-        # Check if we are in the first tensor parallel group.
-        if not self._text_output_stream and not self._json_output_stream:
+        stream = self._output_stream
+
+        if stream is None:  # Means not in the first tensor parallel group.
             return
 
-        for sample_id, prompt, hypotheses in zip(
-            sample_ids, prompts, output.hypotheses
-        ):
+        for prompt, hypotheses in zip(prompts, output.hypotheses):
             if len(hypotheses) == 0:
                 raise RuntimeError(
                     "The sequence generator returned no hypothesis. Please file a bug report."
@@ -427,69 +384,40 @@ class TextGenerateUnit(AbstractGeneratorUnit[SequenceBatch]):
 
             response = self._text_decoder(seq)
 
-            token_indices = seq.tolist()
+            stream.write("<<<<< PROMPT >>>>>")
+            stream.write("\n")
+            stream.write(prompt)
 
-            if hypothesis.score is None:
-                score = None
-            else:
-                score = float(hypothesis.score)
+            stream.write("\n\n\n")
+            stream.write("<<<<< RESPONSE >>>>>")
+            stream.write("\n")
+            stream.write(response)
 
-            if hypothesis.step_scores is None:
-                step_scores = None
-            else:
-                step_scores = hypothesis.step_scores.tolist()
+            stream.write("\n\n\n")
+            stream.write("<<<<< TOKEN INDICES >>>>>")
+            stream.write("\n")
+            stream.write(", ".join(f"{t}" for t in seq.tolist()))
 
-            # Dump as text.
-            if stream := self._text_output_stream:
-                stream.write("<<<<< PROMPT >>>>>")
-                stream.write("\n")
-                stream.write(prompt)
+            score = hypothesis.score
 
-                stream.write("\n\n")
-                stream.write("<<<<< RESPONSE >>>>>")
-                stream.write("\n")
-                stream.write(response)
-
-                stream.write("\n\n")
-                stream.write("<<<<< TOKEN INDICES >>>>>")
-                stream.write("\n")
-                stream.write(", ".join(f"{t}" for t in token_indices))
-
-                if score is not None:
-                    stream.write("\n\n")
-                    stream.write("<<<<< SCORE >>>>>")
-                    stream.write("\n")
-
-                    stream.write(f"{score:.8f}")
-
-                if step_scores is not None:
-                    stream.write("\n\n")
-                    stream.write("<<<<< STEP SCORES >>>>>")
-                    stream.write("\n")
-
-                    stream.write(", ".join(f"{s:.8f}" for s in step_scores))
-
-                stream.write("\n\n\n============================\n\n\n")
-
-            # Dump as JSON.
-            if stream := self._json_output_stream:
-                json_output = {
-                    "id": sample_id,
-                    "prompt": prompt,
-                    "response": response,
-                    "token_indices": token_indices,
-                    "score": score,
-                    "step_scores": step_scores,
-                }
-
-                json.dump(json_output, stream, indent=None)
-
+            if score is not None:
+                stream.write("\n\n\n")
+                stream.write("<<<<< SCORE >>>>>")
                 stream.write("\n")
 
-        if stream := self._text_output_stream:
-            stream.flush()
+                stream.write(f"{float(score):.8f}")
 
-        if stream := self._json_output_stream:
+            step_scores = hypothesis.step_scores
+
+            if step_scores is not None:
+                stream.write("\n\n\n")
+                stream.write("<<<<< STEP SCORES >>>>>")
+                stream.write("\n")
+
+                stream.write(", ".join(f"{s:.8f}" for s in step_scores.tolist()))
+
+            stream.write("\n\n\n============================\n\n\n")
+
             stream.flush()
 
     @property

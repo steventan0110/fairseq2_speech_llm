@@ -21,7 +21,8 @@ from fairseq2.checkpoint import CheckpointModelMetadataProvider, FileCheckpointM
 from fairseq2.config_registry import ConfigRegistry
 from fairseq2.data.text import load_text_tokenizer
 from fairseq2.datasets import LengthBatching
-from fairseq2.datasets.instruction import load_instruction_dataset
+# from fairseq2.datasets.instruction import load_instruction_dataset
+from fairseq2.datasets.speech_text import load_speech_text_dataset, SpeechTextAlignBatch
 from fairseq2.gang import Gang
 from fairseq2.logging import get_log_writer
 from fairseq2.models import load_model
@@ -31,12 +32,13 @@ from fairseq2.models.sequence import (
     SequenceModel,
     SequenceModelOutput,
     as_auto_regressive_input,
+    SpeechTextReprOutput
 )
 from fairseq2.nn.checkpointing import use_layerwise_activation_checkpointing
 from fairseq2.nn.transformer import enable_memory_efficient_torch_sdpa
 from fairseq2.optim import AdamW
 from fairseq2.optim.lr_scheduler import CosineAnnealingLR
-from fairseq2.recipes.common_metrics import SequenceMetricBag
+from fairseq2.recipes.common_metrics import RepresentationAlignMetricBag
 from fairseq2.recipes.trainer import AbstractTrainUnit, Trainer
 from fairseq2.recipes.utils.log import log_model
 from fairseq2.recipes.utils.setup import (
@@ -52,31 +54,33 @@ log = get_log_writer(__name__)
 
 
 @dataclass
-class InstructionFinetuneConfig:
+class SpeechTextAlignConfig:
     """Holds the configuration of a language model instruction-finetuning task."""
 
     # Data
     # dataset: Union[str, Path] = "/fsx-ust/steventan0110/dataset/dinosr_train/mls_en"
-    dataset: Union[str, Path] = "openeft"
+    dataset: Union[str, Path] = "mls_en"
     """The name or path to the asset card of the instruction dataset."""
 
-    max_seq_len: int = 4096
+    max_seq_len: int = 1024
     """The maximum sequence length."""
+    min_seq_len: int = 5
 
-    max_num_tokens: int = 4096 * 2
+    max_num_tokens: int = 1024
     """The maximum number of tokens per batch."""
 
-    example_shuffle_window: int = 10_000
+    example_shuffle_window: int = 10000
     """The size of the sliding window for shuffling examples."""
 
     batch_shuffle_window: int = 1000
     """The size of the sliding window for shuffling batches."""
 
-    num_prefetch: int = 4
+    num_prefetch: int = 10
     """The number of batches to prefetch in background."""
 
     # Model
-    model: Union[str, Path] = "llama3_8b"
+    model: Union[str, Path] = "speech_llama3_8b"
+    # model: Union[str, Path] = "llama3_8b"
     """The name or path to the asset card of the language model to finetune."""
 
     dtype: DataType = torch.bfloat16
@@ -126,7 +130,7 @@ class InstructionFinetuneConfig:
     """The initial and minimum loss scale for fp16 training."""
 
     # Regime
-    max_num_steps: int = 5000
+    max_num_steps: int = 200000
     """The maximum number of steps to train for."""
 
     max_num_data_epochs: Optional[int] = None
@@ -135,7 +139,7 @@ class InstructionFinetuneConfig:
     checkpoint_every_n_steps: int = 1000
     """The step interval at which to checkpoint."""
 
-    keep_last_n_checkpoints: Optional[int] = 1
+    keep_last_n_checkpoints: Optional[int] = 2
     """The number of checkpoints to keep. If ``None``, none will be deleted."""
 
     keep_last_n_models: Optional[int] = None
@@ -149,7 +153,7 @@ class InstructionFinetuneConfig:
     """If not ``None``, adds the specified path to the default asset store."""
 
     # Misc
-    seed: int = 2
+    seed: int = 42
     """The random number generator seed to use."""
 
     profile: Optional[Tuple[int, int]] = None
@@ -160,51 +164,37 @@ class InstructionFinetuneConfig:
 
     anomaly_detection: bool = False
     """If ``True``, turns on anomaly detection feature in ``torch.autograd``."""
+    validate_after_n_steps: int = 1000
 
 
-instruction_finetune_presets = ConfigRegistry[InstructionFinetuneConfig]()
+speech_text_presets = ConfigRegistry[SpeechTextAlignConfig]()
 
-instruction_finetune_preset = instruction_finetune_presets.decorator
+speech_text_preset = speech_text_presets.decorator
 
 
-@instruction_finetune_preset("llama2_7b_chat")
-def _llama2_7b_chat() -> InstructionFinetuneConfig:
-    config = _llama3_8b_instruct()
 
-    config.max_seq_len = 4096
-    config.max_num_tokens = 4096 * 2
-    config.model = "llama2_7b_chat"
-
+@speech_text_preset("llama3_8b_speech_text_align")
+def _llama3_8b_instruct() -> SpeechTextAlignConfig:
+    config =SpeechTextAlignConfig()
+    config.data_parallelism = "ddp"
+    config.max_seq_len = 512
+    config.max_num_tokens = 512
+    config.num_prefetch = 10
+    config.lr = 1e-4
+    config.num_lr_warmup_steps = 2000
     return config
 
 
-@instruction_finetune_preset("llama2_70b_chat")
-def _llama2_70b_chat() -> InstructionFinetuneConfig:
-    config = _llama2_7b_chat()
-
-    config.model = "llama2_70b_chat"
-    config.tensor_parallel_size = 8
-
-    return config
-
-
-@instruction_finetune_preset("llama3_8b_instruct")
-def _llama3_8b_instruct() -> InstructionFinetuneConfig:
-    return InstructionFinetuneConfig()
-
-
-@instruction_finetune_preset("llama3_70b_instruct")
-def _llama3_70b_instruct() -> InstructionFinetuneConfig:
+@speech_text_preset("llama3_70b_instruct")
+def _llama3_70b_instruct() -> SpeechTextAlignConfig:
     config = _llama3_8b_instruct()
-
     config.model = "llama3_70b_instruct"
     config.tensor_parallel_size = 8
-
     return config
 
 
-def load_instruction_finetuner(
-    config: InstructionFinetuneConfig, output_dir: Path
+def load_speech_text_trainer(
+    config: SpeechTextAlignConfig, output_dir: Path
 ) -> Trainer[SequenceBatch]:
     """Load a :class:`Trainer` for language model instruction-finetuning."""
     wall_watch = Stopwatch(start=True)
@@ -215,7 +205,7 @@ def load_instruction_finetuner(
 
     dp_gang = gangs["dp"]  # data
     tp_gang = gangs["tp"]  # tensor
-
+    # print(dp_gang.size, dp_gang.rank)
     checkpoint_manager = FileCheckpointManager(
         output_dir.joinpath("checkpoints"), root_gang, dp_gang=dp_gang, tp_gang=tp_gang
     )
@@ -233,31 +223,15 @@ def load_instruction_finetuner(
     tokenizer = load_text_tokenizer(model_card)
 
     log.info("Tokenizer loaded.")
+    
+    log.info("Loading dataset {}", config.dataset)
 
     # Load the dataset.
     dataset_card = retrieve_asset_card(config.dataset)
-    
     log.info("Loading {} instruction dataset.", dataset_card.name)
 
-
-    dataset = load_instruction_dataset(dataset_card)
+    dataset = load_speech_text_dataset(dataset_card)
     log.info("Dataset loaded.")
-
-    data_reader = dataset.create_reader(
-        tokenizer,
-        dp_gang,
-        config.max_seq_len,
-        batching=LengthBatching(config.max_num_tokens),
-        example_shuffle_window=config.example_shuffle_window,
-        batch_shuffle_window=config.batch_shuffle_window,
-        num_accumulate=config.gradient_accumulation,
-        num_prefetch=config.num_prefetch,
-        seed=config.seed,
-    )
-    for item in data_reader:
-        print(item)
-        exit(0)
-
 
     # Load the model.
     init_device = META
@@ -279,18 +253,25 @@ def load_instruction_finetuner(
         model = load_model(
             model_card, gangs=gangs, device=init_device, dtype=torch.float32
         )
-
         root_gang.barrier()
-
+        
         log.info("Model loaded on data parallel rank 0.")
-
+        # ensure non-szeo weight for the new parameters
+        model.speech_dim_adapter.reset_parameters()
+        def reset_if_possible(module):
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+                # print(f"Reset parameters for {module}")
+        model.speech_decoder.apply(reset_if_possible)
+        # for name, params in model.speech_encoder.unit_extractor.named_parameters():
+        #     print(name, params)
+        # exit(0)
     if not isinstance(model, DecoderModel):
         raise ValueError("`config.model` must specify a decoder model.")
 
     checkpoint_manager.save_model_metadata(
         base_asset=model_card.name, family=model.family
     )
-
     dp_model = to_data_parallel(
         model,
         dp_gang,
@@ -307,6 +288,7 @@ def load_instruction_finetuner(
     if config.activation_checkpointing:
         use_layerwise_activation_checkpointing(dp_model)
 
+
     if config.torch_compile:
         model.decoder = compile_model(model.decoder, log)
 
@@ -314,17 +296,16 @@ def load_instruction_finetuner(
     # The memory efficient SDPA implementation in PyTorch is not stable when
     # used with padded inputs.
     enable_memory_efficient_torch_sdpa(dp_model, False)
-
     log_model(dp_model, log, rank=root_gang.rank)
 
     # Initialize the train unit and the optimizer.
-    unit = InstructionFinetuneUnit(dp_model, dp_gang)
-
+    unit = SpeechTextAlignUnit(dp_model, dp_gang)
     data_reader = dataset.create_reader(
         tokenizer,
         dp_gang,
         config.max_seq_len,
-        batching=LengthBatching(config.max_num_tokens),
+        config.max_num_tokens,
+        config.min_seq_len,
         example_shuffle_window=config.example_shuffle_window,
         batch_shuffle_window=config.batch_shuffle_window,
         num_accumulate=config.gradient_accumulation,
@@ -347,8 +328,10 @@ def load_instruction_finetuner(
     )
 
     # Initialize the trainer.
-    return Trainer[SequenceBatch](
+    return Trainer[SpeechTextAlignBatch](
         unit=unit,
+        # valid_units=[],
+        # valid_data_readers=[],
         data_reader=data_reader,
         root_gang=root_gang,
         dp_gang=dp_gang,
@@ -364,6 +347,7 @@ def load_instruction_finetuner(
         checkpoint_every_n_steps=config.checkpoint_every_n_steps,
         keep_last_n_checkpoints=config.keep_last_n_checkpoints,
         keep_last_n_models=config.keep_last_n_models,
+        # validate_after_n_steps=config.validate_after_n_steps,
         tb_dir=output_dir.joinpath("tb"),
         metrics_dir=output_dir.joinpath("metrics"),
         publish_metrics_every_n_steps=config.publish_metrics_every_n_steps,
@@ -375,10 +359,10 @@ def load_instruction_finetuner(
 
 
 @final
-class InstructionFinetuneUnit(AbstractTrainUnit[SequenceBatch]):
+class SpeechTextAlignUnit(AbstractTrainUnit[SpeechTextAlignBatch]):
     """Represents a language model instruction-finetuning unit."""
 
-    _metric_bag: SequenceMetricBag
+    _metric_bag: RepresentationAlignMetricBag
 
     def __init__(self, model: Module, gang: Gang) -> None:
         """
@@ -388,31 +372,29 @@ class InstructionFinetuneUnit(AbstractTrainUnit[SequenceBatch]):
             The gang for distributed training.
         """
         super().__init__(model)
-
         check_model_type(model, SequenceModel)
-
-        self._metric_bag = SequenceMetricBag(gang)
+        self._metric_bag = RepresentationAlignMetricBag(gang)
 
     @override
-    def __call__(self, batch: SequenceBatch) -> Tuple[Tensor, int]:
-        input_batch, target_batch = as_auto_regressive_input(batch)
+    def __call__(self, batch: SpeechTextAlignBatch) -> Tuple[Tensor, int]:
+        output = self._forward(batch)
+        loss = output.compute_loss()
+        self._metric_bag.update_loss(
+            mse_loss=loss["mse_loss"].item(), 
+            cosine_loss=loss["cosine_sim_loss"].item(), 
+            num_target_elements=loss["target_size"])
 
-        output = self._forward(input_batch)
-
-        loss = output.compute_loss(
-            target_batch.seqs, loss_mask=target_batch.target_mask
-        )
-
-        self._metric_bag.update_nll_loss(target_batch, loss.detach())
-
-        self._metric_bag.update_batch_metrics(target_batch)
-
-        return loss, target_batch.num_target_elements()
-
-    def _forward(self, batch: SequenceBatch) -> SequenceModelOutput:
-        return self._model(batch)  # type: ignore[no-any-return]
+        self._metric_bag.update_batch_metrics(batch.text_tokens)
+        # aggreagte mse and cosine loss, use hard coded weight for now
+        cosine_loss_weight = 5
+        loss_to_return = loss["mse_loss"] + cosine_loss_weight * loss["cosine_sim_loss"]
+        return loss_to_return, loss["target_size"]
+    
+    def _forward(self, batch: SpeechTextAlignBatch) -> SpeechTextReprOutput:
+        return self._model(batch.audios, batch.text_tokens, batch.boundary_index)
 
     @property
     @override
-    def metric_bag(self) -> SequenceMetricBag:
+    def metric_bag(self) -> RepresentationAlignMetricBag:
         return self._metric_bag
+

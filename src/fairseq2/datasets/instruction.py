@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Union, cast, final
+from typing import Any, Dict, Sequence, Union, cast, final
 
 import torch
 from typing_extensions import NoReturn
@@ -46,10 +46,9 @@ class InstructionDataset(ABC):
         max_seq_len: int,
         batching: Union[StaticBatching, LengthBatching],
         *,
-        sample: bool = False,
         example_shuffle_window: int = 1,
         batch_shuffle_window: int = 1,
-        max_num_batches: Optional[int] = None,
+        sample: bool = False,
         num_accumulate: int = 1,
         num_prefetch: int = 1,
         seed: int = 2,
@@ -66,9 +65,6 @@ class InstructionDataset(ABC):
             this value will be dropped.
         :param batching:
             The batching strategy for returned examples.
-        :param sample:
-            If ``True``, instruction sources (e.g. files) will be sampled in
-            proportion to their weights.
         :param example_shuffle_window:
             The size of the sliding window for shuffling examples. If ``1``, no
             shuffling is performed; if ``0``, true shuffling is performed by
@@ -77,8 +73,9 @@ class InstructionDataset(ABC):
             The size of the sliding window for shuffling batches. If ``1``, no
             shuffling is performed; if ``0``, true shuffling is performed by
             loading the entire dataset.
-        :param max_num_batches:
-            The maximum number of batches to return.
+        :param sample:
+            If ``True``, instruction sources (e.g. files) will be sampled in
+            proportion to their weights.
         :param num_accumulate:
             The number of batches to accumulate in each iteration. Typically
             used with gradient accumulation during training.
@@ -245,10 +242,9 @@ class GenericInstructionDataset(InstructionDataset):
         max_seq_len: int,
         batching: Union[StaticBatching, LengthBatching],
         *,
-        sample: bool = False,
         example_shuffle_window: int = 1,
         batch_shuffle_window: int = 1,
-        max_num_batches: Optional[int] = None,
+        sample: bool = False,
         num_accumulate: int = 1,
         num_prefetch: int = 1,
         seed: int = 2,
@@ -294,8 +290,6 @@ class GenericInstructionDataset(InstructionDataset):
         builder.map(target_encoder, selector="tgt", num_parallel_calls=npc)
 
         def cat_source_and_target(example: Dict[str, Any]) -> Dict[str, Any]:
-            sample_id = example.get("id", None)
-
             prompt_indices = example["src"]
             target_indices = example["tgt"]
 
@@ -303,7 +297,7 @@ class GenericInstructionDataset(InstructionDataset):
 
             target_mask = torch.arange(len(indices)) >= len(prompt_indices)
 
-            return {"indices": indices, "target_mask": target_mask, "id": sample_id}
+            return {"indices": indices, "target_mask": target_mask}
 
         builder.map(cat_source_and_target, num_parallel_calls=npc)
 
@@ -341,10 +335,6 @@ class GenericInstructionDataset(InstructionDataset):
 
         builder.map(collater, num_parallel_calls=npc)
 
-        # Return only the first `max_num_batches`.
-        if max_num_batches is not None:
-            builder.take(max_num_batches)
-
         # Prefetch `num_prefetch` batches in background.
         builder.prefetch(num_prefetch)
 
@@ -359,7 +349,7 @@ class GenericInstructionDataset(InstructionDataset):
             return SequenceBatch(seqs, padding_mask, target_mask, example=example)
 
         pipeline = builder.map(to_batch).and_return()
-
+        # pipeline = builder.and_return()
         return DataPipelineReader[SequenceBatch](
             pipeline,
             gang,
@@ -398,10 +388,9 @@ class GenericInstructionDataset(InstructionDataset):
         text_encoder = tokenizer.create_encoder(mode="prompt")
 
         def encode(example: Dict[str, Any]) -> Dict[str, Any]:
-            sample_id = example.get("id", None)
             prompt = example["src"]
 
-            return {"prompt": prompt, "indices": text_encoder(prompt), "id": sample_id}
+            return {"prompt": prompt, "indices": text_encoder(prompt)}
 
         builder.map(encode, num_parallel_calls=npc)
 
